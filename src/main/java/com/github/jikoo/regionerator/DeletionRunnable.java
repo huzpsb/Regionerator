@@ -1,228 +1,217 @@
-/*
- * Copyright (c) 2015-2021 by Jikoo.
- *
- * Regionerator is licensed under a Creative Commons
- * Attribution-ShareAlike 4.0 International License.
- *
- * You should have received a copy of the license along with this
- * work. If not, see <http://creativecommons.org/licenses/by-sa/4.0/>.
- */
-
 package com.github.jikoo.regionerator;
 
-import com.github.jikoo.regionerator.world.ChunkInfo;
-import com.github.jikoo.regionerator.world.RegionInfo;
-import com.github.jikoo.regionerator.world.WorldInfo;
-import java.io.IOException;
-import java.util.List;
-import java.util.concurrent.Phaser;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
-import java.util.stream.Collectors;
+import com.github.jikoo.regionerator.event.RegioneratorChunkDeleteEvent;
+import org.apache.commons.lang3.tuple.ImmutablePair;
+import org.apache.commons.lang3.tuple.Pair;
 import org.bukkit.World;
-import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.scheduler.BukkitRunnable;
-import org.jetbrains.annotations.NotNull;
 
-/**
- * Runnable for checking and deleting chunks and regions.
- */
+import java.io.File;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.util.ArrayList;
+import java.util.ListIterator;
+
 public class DeletionRunnable extends BukkitRunnable {
+    private static final String STATS_FORMAT = "%s - Checked %s/%s, deleted %s regions and %s chunks";
+    private final Regionerator plugin;
+    private final World world;
+    private final File regionFileFolder;
+    private final String[] regions;
+    private final int chunksPerCheck;
+    private final ArrayList<Pair<Integer, Integer>> regionChunks = new ArrayList();
+    private int count = -1;
+    private int regionChunkX;
+    private int regionChunkZ;
+    private int dX = 0;
+    private int dZ = 0;
+    private int regionsDeleted = 0;
+    private int chunksDeleted = 0;
+    private long nextRun = Long.MAX_VALUE;
 
-	private static final String STATS_FORMAT = "%s: checked %s, deleted %s regions & %s chunks";
+    public DeletionRunnable(Regionerator plugin, World world) {
+        this.plugin = plugin;
+        this.world = world;
+        File folder = new File(world.getWorldFolder(), "region");
+        if (!folder.exists()) {
+            folder = new File(world.getWorldFolder(), "DIM-1/region");
+            if (!folder.exists()) {
+                folder = new File(world.getWorldFolder(), "DIM1/region");
+                if (!folder.exists()) {
+                    throw new RuntimeException("World " + world.getName() + " has no generated terrain!");
+                }
+            }
+        }
+        this.regionFileFolder = folder;
+        this.regions = this.regionFileFolder.list(new FilenameFilter() {
+            public boolean accept(File dir, String name) {
+                return name.matches("r\\.-?\\d+\\.-?\\d+\\.mca");
+            }
+        });
+        this.chunksPerCheck = plugin.getChunksPerDeletionCheck();
+        this.handleRegionCompletion();
+    }
 
-	private final @NotNull Regionerator plugin;
-	private final @NotNull Phaser phaser;
-	private final WorldInfo world;
-	private final AtomicLong nextRun = new AtomicLong(Long.MAX_VALUE);
-	private final AtomicInteger regionCount = new AtomicInteger(), heavyChecks = new AtomicInteger(),
-			regionsDeleted = new AtomicInteger(), chunksDeleted = new AtomicInteger();
+    public void run() {
+        if (this.count >= this.regions.length) {
+            this.plugin.getLogger().info("Regeneration cycle complete for " + this.getRunStats());
+            this.nextRun = System.currentTimeMillis() + this.plugin.getMillisecondsBetweenDeletionCycles();
+            this.cancel();
+        } else if (!this.plugin.isPaused() || this.dX != 0 || this.dZ != 0) {
+            for (int i = 0; i < this.chunksPerCheck && this.count < this.regions.length; ++i) {
+                if (this.chunksPerCheck <= 1024 && i > 0 && this.dZ >= 32) {
+                    return;
+                }
 
-	DeletionRunnable(@NotNull Regionerator plugin, @NotNull World world) {
-		this.plugin = plugin;
-		this.phaser = new Phaser(1);
-		this.world = plugin.getWorldManager().getWorld(world);
-	}
+                this.checkNextChunk();
+                if (this.chunksPerCheck <= 1024 && this.dX == 0 && this.dZ == 0) {
+                    return;
+                }
+            }
 
-	@Override
-	public void run() {
-		world.getRegions().forEach(this::handleRegion);
-		plugin.getLogger().info("Regeneration cycle complete for " + getRunStats());
-		nextRun.set(System.currentTimeMillis() + plugin.config().getCycleDelayMillis());
-		if (plugin.config().isRememberCycleDelay()) {
-			try {
-				plugin.getServer().getScheduler().runTask(plugin, () -> plugin.finishCycle(this));
-			} catch (IllegalPluginAccessException e) {
-				// Plugin disabling, odds are on that we were mid-cycle. Don't update finish time.
-			}
-		}
-		phaser.arriveAndDeregister();
-	}
+        }
+    }
 
-	@Override
-	public synchronized boolean isCancelled() throws IllegalStateException {
-		return super.isCancelled() || !plugin.isEnabled();
-	}
+    private void checkNextChunk() {
+        if (!this.plugin.isPaused() || this.dX != 0 || this.dZ != 0) {
+            if (this.count < this.regions.length) {
+                if (this.dX >= 32) {
+                    this.dX = 0;
+                    ++this.dZ;
+                }
 
-	private void handleRegion(@NotNull RegionInfo region) {
-		if (isCancelled()) {
-			return;
-		}
+                if (this.dZ >= 32) {
+                    this.handleRegionCompletion();
+                    if (this.plugin.isPaused() || this.chunksPerCheck <= 1024) {
+                        return;
+                    }
+                }
 
-		phaser.arriveAndAwaitAdvance();
+                int chunkX = this.regionChunkX + this.dX;
+                int chunkZ = this.regionChunkZ + this.dZ;
+                VisitStatus status = this.plugin.getFlagger().getChunkVisitStatus(this.world, chunkX, chunkZ);
+                if (status.ordinal() < VisitStatus.GENERATED.ordinal() || status == VisitStatus.GENERATED) {
+                    this.regionChunks.add(new ImmutablePair(chunkX, chunkZ));
+                }
 
-		regionCount.incrementAndGet();
-		plugin.debug(DebugLevel.HIGH, () -> String.format("Checking %s: %s (%s)",
-				world.getWorld().getName(), region.getIdentifier(), regionCount.get()));
+                ++this.dX;
+            }
+        }
+    }
 
-		try {
-			region.read();
-		} catch (IOException e) {
-			plugin.getLogger().log(Level.WARNING, "Unable to read region!", e);
-			return;
-		}
+    private void handleRegionCompletion() {
+        ListIterator iterator = this.regionChunks.listIterator();
+        Pair regionChunkCoordinates;
+        while (iterator.hasNext()) {
+            regionChunkCoordinates = (Pair) iterator.next();
+            if (this.world.isChunkLoaded((Integer) regionChunkCoordinates.getLeft(), (Integer) regionChunkCoordinates.getRight())) {
+                iterator.remove();
+            }
+        }
+        File regionFile;
+        String regionFileName;
+        if (this.regionChunks.size() == 1024) {
+            regionFileName = this.regions[this.count];
+            regionFile = new File(this.regionFileFolder, regionFileName);
+            if (regionFile.exists() && regionFile.delete()) {
+                ++this.regionsDeleted;
+                if (this.plugin.debug(DebugLevel.MEDIUM)) {
+                    this.plugin.debug(regionFileName + " deleted from " + this.world.getName());
+                }
+                this.plugin.getFlagger().unflagRegion(this.world.getName(), this.regionChunkX, this.regionChunkZ);
+            } else if (this.plugin.debug(DebugLevel.MEDIUM)) {
+                this.plugin.debug(String.format("Unable to delete %s from %s", regionFileName, this.world.getName()));
+            }
+            while (iterator.hasPrevious()) {
+                Pair<Integer, Integer> chunkCoords = (Pair) iterator.previous();
+                this.plugin.getServer().getPluginManager().callEvent(new RegioneratorChunkDeleteEvent(this.world, (Integer) chunkCoords.getLeft(), (Integer) chunkCoords.getRight()));
+            }
+        } else if (this.regionChunks.size() > 0) {
+            regionFileName = this.regions[this.count];
+            regionFile = new File(this.regionFileFolder, regionFileName);
+            if (!regionFile.canWrite() && !regionFile.setWritable(true) && !regionFile.canWrite()) {
+                if (this.plugin.debug(DebugLevel.MEDIUM)) {
+                    this.plugin.debug(String.format("Unable to set %s in %s writable to delete %s chunks", regionFileName, this.world.getName(), this.regionChunks.size()));
+                }
+                return;
+            }
+            try {
+                Throwable var23 = null;
 
-		// Collect potentially eligible chunks
-		List<ChunkInfo> chunks = region.getChunks().filter(this::isDeleteEligible).collect(Collectors.toList());
+                RandomAccessFile regionRandomAccess = new RandomAccessFile(regionFile, "rwd");
+                try {
+                    byte[] pointers = new byte[4096];
+                    regionRandomAccess.read(pointers);
+                    int chunkCount = 0;
 
-		if (chunks.size() != region.getChunksPerRegion()) {
-			plugin.debug(DebugLevel.HIGH, () ->
-					String.format("Not all chunks are delete-eligible (%s) - removing unnecessary chunks", chunks.size()));
-			// If entire region is not being deleted, filter out chunks that are already orphaned or freshly generated
-			chunks.removeIf(chunk -> {
-				if (isCancelled()) {
-					return true;
-				}
-				VisitStatus visitStatus = chunk.getVisitStatus();
-				return visitStatus == VisitStatus.ORPHANED || !plugin.config().isDeleteFreshChunks(world.getWorld()) && visitStatus == VisitStatus.GENERATED;
-			});
-		} else if (!plugin.config().isDeleteFreshChunks(world.getWorld())
-				&& chunks.stream().noneMatch(chunk -> chunk.getVisitStatus() == VisitStatus.UNVISITED)) {
-			// If we're configured to not delete fresh chunks and the whole region is likely fresh, do nothing.
-			plugin.debug(DebugLevel.HIGH, () -> "Skipping region - chunks are freshly generated.");
-			return;
-		}
+                    while (iterator.hasPrevious()) {
+                        Pair<Integer, Integer> chunkCoords = (Pair) iterator.previous();
+                        this.plugin.getFlagger().unflagChunk(this.world.getName(), (Integer) chunkCoords.getLeft(), (Integer) chunkCoords.getRight());
+                        int pointer = 4 * ((Integer) chunkCoords.getLeft() - this.regionChunkX + ((Integer) chunkCoords.getRight() - this.regionChunkZ) * 32);
+                        boolean orphaned = true;
+                        for (int i = pointer; i < pointer + 4; ++i) {
+                            if (pointers[i] != 0) {
+                                pointers[i] = 0;
+                                orphaned = false;
+                            }
+                        }
+                        if (!orphaned) {
+                            this.plugin.getServer().getPluginManager().callEvent(new RegioneratorChunkDeleteEvent(this.world, (Integer) chunkCoords.getLeft(), (Integer) chunkCoords.getRight()));
+                            if (this.plugin.debug(DebugLevel.HIGH)) {
+                                this.plugin.debug(String.format("Wiping chunk %s, %s from %s in %s of %s", chunkCoords.getLeft(), chunkCoords.getRight(), pointer, regionFileName, this.world.getName()));
+                            }
+                            ++chunkCount;
+                        }
+                    }
+                    regionRandomAccess.write(pointers, 0, 4096);
+                    regionRandomAccess.close();
+                    this.chunksDeleted += chunkCount;
+                    if (this.plugin.debug(DebugLevel.MEDIUM)) {
+                        this.plugin.debug(String.format("%s chunks deleted from %s of %s", chunkCount, regionFileName, this.world.getName()));
+                    }
+                } finally {
+                    if (regionRandomAccess != null) {
+                        regionRandomAccess.close();
+                    }
+                }
+            } catch (IOException var21) {
+                if (this.plugin.debug(DebugLevel.MEDIUM)) {
+                    this.plugin.debug(String.format("Caught an IOException writing %s in %s to delete %s chunks", regionFileName, this.world.getName(), this.regionChunks.size()));
+                }
+            }
+        }
 
-		if (chunks.isEmpty()) {
-			// If no chunks are modified, do nothing.
-			plugin.debug(DebugLevel.HIGH, () -> "Skipping region - no chunks are delete-eligible.");
-			recover();
-			return;
-		}
+        this.regionChunks.clear();
+        ++this.count;
+        if (this.plugin.debug(DebugLevel.LOW) && this.count % 20 == 0 && this.count > 0) {
+            this.plugin.debug(this.getRunStats());
+        }
 
-		// Orphan chunks. N.B. Changes do not take effect until RegionInfo#write is called.
-		chunks.forEach(ChunkInfo::setOrphaned);
+        if (this.count < this.regions.length) {
+            this.dX = 0;
+            this.dZ = 0;
+            this.regionChunks.clear();
+            regionChunkCoordinates = this.parseRegion(this.regions[this.count]);
+            this.regionChunkX = (Integer) regionChunkCoordinates.getLeft();
+            this.regionChunkZ = (Integer) regionChunkCoordinates.getRight();
+            if (this.plugin.debug(DebugLevel.HIGH)) {
+                this.plugin.debug(String.format("Checking %s:%s (%s/%s)", this.world.getName(), this.regions[this.count], this.count, this.regions.length));
+            }
 
-		try {
-			region.write();
-			chunks.forEach(chunk -> plugin.getFlagger().unflagChunk(chunk.getWorld().getName(), chunk.getChunkX(), chunk.getChunkZ()));
-			if (chunks.size() == region.getChunksPerRegion()) {
-				regionsDeleted.incrementAndGet();
-			} else {
-				chunksDeleted.addAndGet(chunks.size());
-			}
-		} catch (IOException e) {
-			plugin.debug(() -> String.format(
-					"Caught an IOException attempting to populate chunk data: %s", e.getMessage()), e);
-		}
+        }
+    }
 
-		if (regionCount.get() % 20 == 0) {
-			plugin.debug(DebugLevel.LOW, this::getRunStats);
-		}
+    public String getRunStats() {
+        return String.format("%s - Checked %s/%s, deleted %s regions and %s chunks", this.world.getName(), this.count, this.regions.length, this.regionsDeleted, this.chunksDeleted);
+    }
 
-		recover();
-	}
+    public long getNextRun() {
+        return this.nextRun;
+    }
 
-	private void recover() {
-		if (isCancelled()) {
-			return;
-		}
-		try {
-			// Allow server to recover for configured time.
-			Thread.sleep(plugin.config().getDeletionRecoveryMillis());
-		} catch (InterruptedException ignored) {
-		}
-		// Reset chunk count after sleep.
-		heavyChecks.set(0);
-	}
-
-	private boolean isDeleteEligible(@NotNull ChunkInfo chunkInfo) {
-		if (isCancelled()) {
-			// If task is cancelled, report all chunks ineligible for deletion
-			plugin.debug(DebugLevel.HIGH, () -> "Deletion task is cancelled, chunks are ineligible for delete.");
-			return false;
-		}
-
-		if (chunkInfo.isOrphaned()) {
-			// Chunk already deleted
-			plugin.debug(DebugLevel.HIGH, () -> String.format("Chunk %s_%s_%s is already orphaned.",
-					chunkInfo.getWorld().getName(), chunkInfo.getChunkX(), chunkInfo.getChunkZ()));
-			return true;
-		}
-
-		long now = System.currentTimeMillis();
-		long lastVisit = chunkInfo.getLastVisit();
-		boolean isFresh = !plugin.config().isDeleteFreshChunks(world.getWorld()) && lastVisit == plugin.config().getFlagGenerated(world.getWorld());
-
-		if (!isFresh && now <= lastVisit) {
-			// Chunk is visited
-			plugin.debug(DebugLevel.HIGH, () -> String.format("Chunk %s_%s_%s is visited until %s",
-					chunkInfo.getWorld().getName(), chunkInfo.getChunkX(), chunkInfo.getChunkZ(), lastVisit));
-			return false;
-		}
-
-		if (!isFresh && now - plugin.config().getFlagDuration(chunkInfo.getWorld()) <= chunkInfo.getLastModified()) {
-			plugin.debug(DebugLevel.HIGH, () -> String.format("Chunk %s_%s_%s is modified until %s",
-					chunkInfo.getWorld().getName(), chunkInfo.getChunkX(), chunkInfo.getChunkZ(), chunkInfo.getLastModified()));
-			return false;
-		}
-
-		// Do recovery for heavy checks as required.
-		if (heavyChecks.incrementAndGet() >= plugin.config().getDeletionChunkCount()) {
-			recover();
-		}
-
-		if (plugin.debug(DebugLevel.HIGH)) {
-			plugin.getDebugListener().monitorChunk(chunkInfo.getChunkX(), chunkInfo.getChunkZ());
-		}
-
-		VisitStatus visitStatus;
-		try {
-			// Calculate VisitStatus including protection hooks.
-			visitStatus = chunkInfo.getVisitStatus();
-		} catch (RuntimeException e) {
-			// Interruption is not due to plugin shutdown, log.
-			if (!this.isCancelled() && plugin.isEnabled()) {
-				plugin.debug(() -> String.format("Caught an exception getting VisitStatus: %s", e.getMessage()), e);
-			}
-
-			// If an exception occurred, do not delete chunk.
-			visitStatus = VisitStatus.UNKNOWN;
-		}
-
-		if (plugin.debug(DebugLevel.HIGH)) {
-			plugin.getDebugListener().ignoreChunk(chunkInfo.getChunkX(), chunkInfo.getChunkZ());
-		}
-
-		return visitStatus.ordinal() < VisitStatus.VISITED.ordinal();
-
-	}
-
-	public String getRunStats() {
-		return String.format(STATS_FORMAT, world.getWorld().getName(), regionCount.get(), regionsDeleted, chunksDeleted);
-	}
-
-	public @NotNull String getWorld() {
-		return world.getWorld().getName();
-	}
-
-	public long getNextRun() {
-		return nextRun.get();
-	}
-
-	@NotNull Phaser getPhaser() {
-		return phaser;
-	}
-
+    private Pair<Integer, Integer> parseRegion(String regionFile) {
+        String[] split = regionFile.split("\\.");
+        return new ImmutablePair(Integer.parseInt(split[1]) << 5, Integer.parseInt(split[2]) << 5);
+    }
 }

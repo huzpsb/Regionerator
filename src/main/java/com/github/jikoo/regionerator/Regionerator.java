@@ -1,362 +1,303 @@
-/*
- * Copyright (c) 2015-2021 by Jikoo.
- *
- * Regionerator is licensed under a Creative Commons
- * Attribution-ShareAlike 4.0 International License.
- *
- * You should have received a copy of the license along with this
- * work. If not, see <http://creativecommons.org/licenses/by-sa/4.0/>.
- */
-
 package com.github.jikoo.regionerator;
 
-import com.github.jikoo.regionerator.commands.RegioneratorExecutor;
-import com.github.jikoo.regionerator.hooks.Hook;
-import com.github.jikoo.regionerator.hooks.PluginHook;
-import com.github.jikoo.regionerator.listeners.DebugListener;
-import com.github.jikoo.regionerator.listeners.FlaggingListener;
-import com.github.jikoo.regionerator.listeners.HookListener;
-import com.github.jikoo.regionerator.listeners.WorldListener;
-import com.github.jikoo.regionerator.util.yaml.Config;
-import com.github.jikoo.regionerator.util.yaml.MiscData;
-import java.io.File;
-import java.lang.reflect.InvocationTargetException;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Phaser;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
-import java.util.function.Supplier;
-import java.util.logging.Level;
-import java.util.stream.Collectors;
+import com.google.common.collect.ImmutableList;
 import org.bukkit.Bukkit;
 import org.bukkit.World;
-import org.bukkit.command.PluginCommand;
-import org.bukkit.configuration.ConfigurationSection;
-import org.bukkit.event.HandlerList;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.scheduler.BukkitRunnable;
-import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
 
-/**
- * Plugin for deleting unused region files gradually.
- */
-@SuppressWarnings({"WeakerAccess"})
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.Map.Entry;
+
 public class Regionerator extends JavaPlugin {
+    private long flagDuration;
+    private long ticksPerFlag;
+    private long ticksPerFlagAutosave;
+    private List<String> worlds;
+    private ChunkFlagger chunkFlagger;
+    private HashMap<String, DeletionRunnable> deletionRunnables;
+    private long millisBetweenCycles;
+    private DebugLevel debugLevel;
+    private boolean paused;
 
-	private final Map<String, DeletionRunnable> deletionRunnables = new ConcurrentHashMap<>();
-	private final Set<Hook> protectionHooks = Collections.newSetFromMap(new ConcurrentHashMap<>());
-	private final WorldManager worldManager = new WorldManager(this);
-	private final AtomicBoolean paused = new AtomicBoolean();
-	private ChunkFlagger chunkFlagger;
-	private Config config;
-	private MiscData miscData;
-	private FlaggingListener flagger;
-	private DebugListener debugListener;
+    public void onEnable() {
+        this.saveDefaultConfig();
+        this.paused = false;
+        List<String> worldList = this.getConfig().getStringList("worlds");
+        if (worldList.isEmpty()) {
+            this.getLogger().severe("No worlds are enabled. Disabling!");
+            this.getServer().getPluginManager().disablePlugin(this);
+        } else {
+            boolean dirtyConfig = false;
 
-	@Override
-	public void onEnable() {
+            try {
+                this.debugLevel = DebugLevel.valueOf(this.getConfig().getString("debug-level", "OFF").toUpperCase());
+            } catch (IllegalArgumentException var9) {
+                this.debugLevel = DebugLevel.OFF;
+                this.getConfig().set("debug-level", "OFF");
+                dirtyConfig = true;
+            }
 
-		saveDefaultConfig();
-		config = new Config(this);
-		miscData = new MiscData(this, new File(getDataFolder(), "data.yml"));
+            if (this.debug(DebugLevel.LOW)) {
+                this.debug("Debug level: " + this.debugLevel.name());
+            }
 
-		boolean migrated = false;
-		Set<String> worlds = getServer().getWorlds().stream().map(World::getName).filter(config::isEnabled).collect(Collectors.toSet());
-		for (String world : worlds) {
-			if (getConfig().isLong("delete-this-to-reset-plugin." + world)) {
-				// Migrate existing settings
-				miscData.setNextCycle(world, getConfig().getLong("delete-this-to-reset-plugin." + world));
-				migrated = true;
-			}
-		}
-		if (migrated) {
-			getConfig().set("delete-this-to-reset-plugin", null);
-			saveConfig();
-		}
+            this.worlds = new ArrayList();
+            Iterator var4 = Bukkit.getWorlds().iterator();
 
-		miscData.checkWorldValidity();
+            while (true) {
+                while (var4.hasNext()) {
+                    World world = (World) var4.next();
+                    if (worldList.contains(world.getName())) {
+                        this.worlds.add(world.getName());
+                    } else {
+                        Iterator var6 = worldList.iterator();
 
-		chunkFlagger = new ChunkFlagger(this);
-		debugListener = new DebugListener(this);
+                        while (var6.hasNext()) {
+                            String name = (String) var6.next();
+                            if (world.getName().equalsIgnoreCase(name)) {
+                                this.worlds.add(world.getName());
+                                dirtyConfig = true;
+                                break;
+                            }
+                        }
+                    }
+                }
 
-		PluginCommand command = getCommand("regionerator");
-		RegioneratorExecutor executor = new RegioneratorExecutor(this, deletionRunnables);
-		if (command != null) {
-			command.setExecutor(executor);
-		}
+                this.worlds = ImmutableList.copyOf(this.worlds);
+                if (dirtyConfig) {
+                    this.getConfig().set("worlds", this.worlds);
+                }
 
-		getServer().getPluginManager().registerEvents(new WorldListener(this), this);
+                if (this.getConfig().getInt("days-till-flag-expires") < 1) {
+                    this.getConfig().set("days-till-flag-expires", 1);
+                    dirtyConfig = true;
+                }
 
-		// Don't load features if there are no worlds configured
-		if (config.enabledWorlds().isEmpty()) {
-			getLogger().severe("No worlds are enabled. There's nothing to do!");
-			return;
-		}
+                this.flagDuration = 86400000L * (long) this.getConfig().getInt("days-till-flag-expires");
+                var4 = this.worlds.iterator();
 
-		/*
-		 * Load features after server has finished boot.
-		 * While softdepend should take care of this for us, as soon as another plugin causes
-		 * a circular dependency Bukkit makes no attempt to resolve soft dependencies at all.
-		 * To combat this, we load features after the server boots.
-		 */
-		getServer().getScheduler().runTask(this, () -> {
-			reloadFeatures();
+                String pluginName;
+                while (var4.hasNext()) {
+                    pluginName = (String) var4.next();
+                    if (this.getConfig().getLong("delete-this-to-reset-plugin." + pluginName, 0L) == 0L) {
+                        this.getConfig().set("delete-this-to-reset-plugin." + pluginName, System.currentTimeMillis() + this.flagDuration);
+                        dirtyConfig = true;
+                    }
+                }
 
-			debug(DebugLevel.LOW, () -> executor.onCommand(Bukkit.getConsoleSender(), Objects.requireNonNull(command), "regionerator", new String[0]));
-		});
-	}
+                if (this.getConfig().getInt("chunk-flag-radius") < 0) {
+                    this.getConfig().set("chunk-flag-radius", 4);
+                    dirtyConfig = true;
+                }
 
-	@Override
-	public void onDisable() {
-		// Manually cancel deletion runnables - Bukkit does not do a good job of informing tasks they can't continue.
-		deletionRunnables.values().forEach(BukkitRunnable::cancel);
-		deletionRunnables.clear();
-		getServer().getScheduler().cancelTasks(this);
+                if (this.getConfig().getInt("seconds-per-flag") < 1) {
+                    this.getConfig().set("seconds-per-flag", 10);
+                    dirtyConfig = true;
+                }
 
-		if (chunkFlagger != null) {
-			getLogger().info("Shutting down flagger - currently holds " + chunkFlagger.getCached() + " flags.");
-			chunkFlagger.shutdown();
-		}
+                this.ticksPerFlag = (long) this.getConfig().getInt("seconds-per-flag") * 20L;
+                if (this.getConfig().getInt("minutes-per-flag-autosave") < 1) {
+                    this.getConfig().set("minutes-per-flag-autosave", 5);
+                    dirtyConfig = true;
+                }
 
-		protectionHooks.clear();
-	}
+                this.ticksPerFlagAutosave = (long) this.getConfig().getInt("minutes-per-flag-autosave") * 1200L;
+                if (this.getConfig().getLong("ticks-per-deletion") < 1L) {
+                    this.getConfig().set("ticks-per-deletion", 20L);
+                    dirtyConfig = true;
+                }
 
-	@Override
-	public void reloadConfig() {
-		super.reloadConfig();
-		if (this.config != null) {
-			this.config.reload();
-		}
-		if (this.miscData != null) {
-			this.miscData.reload();
-		}
-	}
+                if (this.getConfig().getInt("chunks-per-deletion") < 1) {
+                    this.getConfig().set("chunks-per-deletion", 20);
+                    dirtyConfig = true;
+                }
 
-	public void reloadFeatures() {
-		// Remove all existing features
-		HandlerList.unregisterAll(this);
-		if (flagger != null) {
-			flagger.cancel();
-		}
-		// Remove only hooks added by Regionerator to not break other plugins' hooks on reload.
-		protectionHooks.removeIf(hook -> hook.getClass().getPackage().getName().equals("com.github.jikoo.regionerator.hooks"));
+                if (this.getConfig().getInt("hours-between-cycles") < 0) {
+                    this.getConfig().set("hours-between-cycles", 0);
+                    dirtyConfig = true;
+                }
+                this.millisBetweenCycles = (long) this.getConfig().getInt("hours-between-cycles") * 3600000L;
+                if (dirtyConfig) {
+                    this.getConfig().options().copyHeader(true);
+                    this.saveConfig();
+                }
+                this.chunkFlagger = new ChunkFlagger(this);
+                this.chunkFlagger.scheduleSaving();
+                this.deletionRunnables = new HashMap();
+                (new FlaggingRunnable(this)).runTaskTimer(this, 0L, this.getTicksPerFlag());
+                this.getServer().getPluginManager().registerEvents(new FlaggingListener(this), this);
+                if (this.debug(DebugLevel.LOW)) {
+                    this.onCommand(Bukkit.getConsoleSender(), (Command) null, (String) null, new String[0]);
+                }
+                return;
+            }
+        }
+    }
 
-		debug(DebugLevel.LOW, () -> "Loading features...");
-		// Always enable hook listener in case someone else adds hooks.
-		getServer().getPluginManager().registerEvents(new HookListener(this), this);
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        this.attemptDeletionActivation();
+        if (args.length > 0) {
+            args[0] = args[0].toLowerCase();
+            if (args[0].equals("reload")) {
+                this.reloadConfig();
+                this.onDisable();
+                this.onEnable();
+                sender.sendMessage("Regionerator configuration reloaded, all tasks restarted!");
+                return true;
+            } else if (!args[0].equals("pause") && !args[0].equals("stop")) {
+                if (!args[0].equals("resume") && !args[0].equals("unpause") && !args[0].equals("start")) {
+                    return false;
+                } else {
+                    this.paused = false;
+                    sender.sendMessage("Resumed Regionerator. Use /regionerator pause to pause.");
+                    return true;
+                }
+            } else {
+                this.paused = true;
+                sender.sendMessage("Paused Regionerator. Use /regionerator resume to resume.");
+                return true;
+            }
+        } else {
+            SimpleDateFormat format = new SimpleDateFormat("HH:mm 'on' dd/MM");
+            boolean running = false;
+            Iterator var8 = this.worlds.iterator();
 
-		Set<String> hookNames = Objects.requireNonNull(Objects.requireNonNull(getConfig().getDefaults()).getConfigurationSection("hooks")).getKeys(false);
-		ConfigurationSection hookSection = getConfig().getConfigurationSection("hooks");
-		if (hookSection != null) {
-			hookNames.addAll(hookSection.getKeys(false));
-		}
-		for (String hookName : hookNames) {
-			// Default true - hooks should likely be enabled unless explicitly disabled
-			if (!getConfig().getBoolean("hooks." + hookName, true)) {
-				continue;
-			}
-			Class<?> clazz;
-			try {
-				clazz = Class.forName("com.github.jikoo.regionerator.hooks." + hookName + "Hook");
-				if (!Hook.class.isAssignableFrom(clazz)) {
-					// What.
-					continue;
-				}
-			} catch (ClassNotFoundException e) {
-				// No hook by the name specified.
-				continue;
-			} catch (NoClassDefFoundError e) {
-				// Class exists, but dependencies are not available.
-				debug(() -> String.format("Dependencies not found for %s hook, skipping.", hookName), e);
-				continue;
-			}
+            while (true) {
+                while (var8.hasNext()) {
+                    String worldName = (String) var8.next();
+                    long activeAt = this.getConfig().getLong("delete-this-to-reset-plugin." + worldName);
+                    if (activeAt > System.currentTimeMillis()) {
+                        sender.sendMessage(worldName + " - Gathering data, regeneration starts " + format.format(new Date(activeAt)));
+                    } else if (this.deletionRunnables.containsKey(worldName)) {
+                        DeletionRunnable runnable = (DeletionRunnable) this.deletionRunnables.get(worldName);
+                        sender.sendMessage(runnable.getRunStats());
+                        if (runnable.getNextRun() < Long.MAX_VALUE) {
+                            sender.sendMessage("Cycle is finished. Next run scheduled for " + format.format(runnable.getNextRun()));
+                        } else if (!this.getConfig().getBoolean("allow-concurrent-cycles")) {
+                            running = true;
+                        }
+                    } else if (running && !this.getConfig().getBoolean("allow-concurrent-cycles")) {
+                        sender.sendMessage("Cycle for " + worldName + " is ready to start.");
+                    } else if (!running) {
+                        this.getLogger().severe("Deletion cycle failed to start for " + worldName + "! Please report this issue if you see any errors!");
+                    }
+                }
 
-			try {
-				Hook hook = (Hook) clazz.getDeclaredConstructor().newInstance();
-				if (!hook.areDependenciesPresent()) {
-					debug(DebugLevel.LOW, () -> String.format("Dependencies not found for %s hook, skipping.", hookName));
-					continue;
-				}
-				if (hook.isHookUsable()) {
-					protectionHooks.add(hook);
-					debug(DebugLevel.LOW, () -> "Enabled protection hook for " + hookName);
-				} else {
-					getLogger().warning("Protection hook for " + hookName + " failed usability check! Deletion is paused.");
-					setPaused(true);
-				}
-			} catch (NoClassDefFoundError e) {
-				debug(() -> String.format("Dependencies not found for %s hook, skipping.", hookName), e);
-			} catch (ReflectiveOperationException e) {
-				if (e instanceof InvocationTargetException && e.getCause() instanceof ClassNotFoundException) {
-					debug(() -> String.format("Dependencies not found for %s hook, skipping.", hookName), e);
-				} else {
-					getLogger().log(Level.SEVERE, "Unable to enable hook for " + hookName + "! Deletion is paused.", e);
-					setPaused(true);
-				}
-			}
-		}
+                return true;
+            }
+        }
+    }
 
-		if (getServer().getWorlds().stream().anyMatch(world -> config.getFlagDuration(world) > 0)) {
-			// Flag duration is set, start flagging
-			flagger = new FlaggingListener(this);
-			getServer().getPluginManager().registerEvents(flagger, this);
-		}
+    public void onDisable() {
+        this.getServer().getScheduler().cancelTasks(this);
+        if (this.chunkFlagger != null) {
+            this.chunkFlagger.save();
+        }
+    }
 
-		// Periodically attempt to start deletion
-		getServer().getScheduler().runTaskTimer(this, this::attemptDeletionActivation, 0L, 1200L);
+    public long getVisitFlag() {
+        return this.flagDuration + System.currentTimeMillis();
+    }
 
-		if (debug(DebugLevel.HIGH)) {
-			getServer().getPluginManager().registerEvents(debugListener, this);
-		}
-		debug(DebugLevel.LOW, () -> "Load complete!");
-	}
+    public int getChunkFlagRadius() {
+        return this.getConfig().getInt("chunk-flag-radius");
+    }
 
-	public Config config() {
-		return config;
-	}
+    public long getTicksPerFlag() {
+        return this.ticksPerFlag;
+    }
 
-	public MiscData getMiscData() {
-		return miscData;
-	}
+    public long getTicksPerFlagAutosave() {
+        return this.ticksPerFlagAutosave;
+    }
 
-	public @NotNull WorldManager getWorldManager() {
-		return worldManager;
-	}
+    public int getChunksPerDeletionCheck() {
+        return this.getConfig().getInt("chunks-per-deletion");
+    }
 
-	void finishCycle(@NotNull DeletionRunnable runnable) {
-		miscData.setNextCycle(runnable.getWorld(), runnable.getNextRun());
-	}
+    public long getTicksPerDeletionCheck() {
+        return this.getConfig().getLong("ticks-per-deletion");
+    }
 
-	/**
-	 * Attempts to activate {@link DeletionRunnable}s for any configured worlds.
-	 */
-	public void attemptDeletionActivation() {
-		deletionRunnables.values().removeIf(value -> value.getNextRun() < System.currentTimeMillis());
+    public long getMillisecondsBetweenDeletionCycles() {
+        return this.millisBetweenCycles;
+    }
 
-		if (isPaused()) {
-			return;
-		}
+    public void attemptDeletionActivation() {
+        Iterator iterator = this.deletionRunnables.entrySet().iterator();
 
-		for (String worldName : config.enabledWorlds()) {
-			if (miscData.getNextCycle(worldName) > System.currentTimeMillis()) {
-				// Not time yet.
-				continue;
-			}
-			DeletionRunnable runnable = deletionRunnables.get(worldName);
-			if (runnable != null) {
-				if (runnable.getNextRun() == Long.MAX_VALUE) {
-					// Deletion is ongoing for world.
-					return;
-				}
-				// Deletion is complete for world.
-				continue;
-			}
-			World world = Bukkit.getWorld(worldName);
-			if (world == null) {
-				// World is not loaded.
-				continue;
-			}
-			try {
-				runnable = new DeletionRunnable(this, world);
-			} catch (RuntimeException e) {
-				debug(DebugLevel.HIGH, e::getMessage);
-				continue;
-			}
-			runnable.runTaskAsynchronously(this);
-			deletionRunnables.put(worldName, runnable);
-			debug(DebugLevel.LOW, () -> "Deletion run scheduled for " + world.getName());
-			return;
-		}
-	}
+        while (iterator.hasNext()) {
+            if (((DeletionRunnable) ((Entry) iterator.next()).getValue()).getNextRun() < System.currentTimeMillis()) {
+                iterator.remove();
+            }
+        }
 
-	public @NotNull Set<Hook> getProtectionHooks() {
-		return Collections.unmodifiableSet(this.protectionHooks);
-	}
+        if (!this.isPaused()) {
+            Iterator var3 = this.worlds.iterator();
 
-	public void addHook(@Nullable PluginHook hook) {
-		if (hook == null) {
-			throw new IllegalArgumentException("Hook cannot be null");
-		}
+            String worldName;
+            do {
+                while (true) {
+                    do {
+                        if (!var3.hasNext()) {
+                            return;
+                        }
 
-		for (Hook enabledHook : this.protectionHooks) {
-			if (enabledHook.getClass().equals(hook.getClass())) {
-				throw new IllegalStateException(String.format("Hook %s is already enabled", hook.getProtectionName()));
-			}
-		}
+                        worldName = (String) var3.next();
+                    } while (this.getConfig().getLong("delete-this-to-reset-plugin." + worldName) > System.currentTimeMillis());
 
-		if (!hook.isHookUsable()) {
-			throw new IllegalStateException(String.format("Hook %s is not usable", hook.getProtectionName()));
-		}
+                    if (this.deletionRunnables.containsKey(worldName)) {
+                        break;
+                    }
 
-		this.protectionHooks.add(hook);
-	}
+                    World world = Bukkit.getWorld(worldName);
+                    if (world != null) {
+                        DeletionRunnable runnable;
+                        try {
+                            runnable = new DeletionRunnable(this, world);
+                        } catch (RuntimeException var7) {
+                            if (this.debug(DebugLevel.HIGH)) {
+                                this.debug(var7.getMessage());
+                            }
+                            continue;
+                        }
 
-	public boolean removeHook(Class<? extends Hook> hook) {
-		Iterator<Hook> hookIterator = this.protectionHooks.iterator();
-		while (hookIterator.hasNext()) {
-			if (hookIterator.next().getClass().equals(hook)) {
-				hookIterator.remove();
-				return true;
-			}
-		}
-		return false;
-	}
+                        runnable.runTaskTimer(this, 0L, this.getTicksPerDeletionCheck());
+                        this.deletionRunnables.put(worldName, runnable);
+                        if (this.debug(DebugLevel.LOW)) {
+                            this.debug("Deletion run scheduled for " + world.getName());
+                        }
 
-	public boolean removeHook(Hook hook) {
-		return this.protectionHooks.remove(hook);
-	}
+                        if (!this.getConfig().getBoolean("allow-concurrent-cycles")) {
+                            return;
+                        }
+                    }
+                }
+            } while (this.getConfig().getBoolean("allow-concurrent-cycles") || ((DeletionRunnable) this.deletionRunnables.get(worldName)).getNextRun() != Long.MAX_VALUE);
 
-	public ChunkFlagger getFlagger() {
-		return this.chunkFlagger;
-	}
+        }
+    }
 
-	DebugListener getDebugListener() {
-		return debugListener;
-	}
+    public List<String> getActiveWorlds() {
+        return this.worlds;
+    }
 
-	public boolean isPaused() {
-		return this.paused.get();
-	}
+    public ChunkFlagger getFlagger() {
+        return this.chunkFlagger;
+    }
 
-	public void setPaused(boolean paused) {
-		boolean wasPaused = this.paused.getAndSet(paused);
+    public boolean isPaused() {
+        return this.paused;
+    }
 
-		if (paused == wasPaused) {
-			return;
-		}
+    public boolean debug(DebugLevel level) {
+        return this.debugLevel.ordinal() >= level.ordinal();
+    }
 
-		Consumer<Phaser> phaserConsumer = paused ? Phaser::register : Phaser::arriveAndDeregister;
-		deletionRunnables.values().stream().map(DeletionRunnable::getPhaser).forEach(phaserConsumer);
-	}
-
-	public boolean debug(@NotNull DebugLevel level) {
-		return config.getDebugLevel().ordinal() >= level.ordinal();
-	}
-
-	public void debug(@NotNull DebugLevel level, @NotNull Supplier<String> message) {
-		if (debug(level)) {
-			getLogger().info(message.get());
-		}
-	}
-
-	public void debug(@NotNull DebugLevel level, @NotNull Runnable runnable) {
-		if (debug(level)) {
-			runnable.run();
-		}
-	}
-
-	public void debug(@NotNull Supplier<String> message, Throwable throwable) {
-		if (debug(DebugLevel.MEDIUM)) {
-			getLogger().log(Level.WARNING, message.get(), throwable);
-		} else if (debug(DebugLevel.LOW)) {
-			getLogger().log(Level.WARNING, message.get());
-		}
-	}
-
+    public void debug(String message) {
+        this.getLogger().info(message);
+    }
 }
